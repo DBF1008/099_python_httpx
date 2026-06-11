@@ -87,6 +87,11 @@ def redirects(request: httpx.Request) -> httpx.Response:
         headers = {"location": "/redirect_body_target"}
         return httpx.Response(status_code, headers=headers)
 
+    elif request.url.path == "/redirect_307":
+        status_code = httpx.codes.TEMPORARY_REDIRECT
+        headers = {"location": "/redirect_body_target"}
+        return httpx.Response(status_code, headers=headers)
+
     elif request.url.path == "/redirect_body_target":
         data = {
             "body": request.content.decode("ascii"),
@@ -445,3 +450,258 @@ async def test_async_invalid_redirect():
             await client.get(
                 "http://example.org/invalid_redirect", follow_redirects=True
             )
+
+
+# --- New sync tests ---
+
+
+def test_redirect_307():
+    """
+    A 307 redirect should preserve both the request method and body.
+    """
+    client = httpx.Client(transport=httpx.MockTransport(redirects))
+    url = "https://example.org/redirect_307"
+    content = b"Example request body"
+    response = client.post(url, content=content, follow_redirects=True)
+    assert response.url == "https://example.org/redirect_body_target"
+    assert response.json()["body"] == "Example request body"
+    assert "content-length" in response.json()["headers"]
+
+
+def test_cross_domain_redirect_strips_cookie():
+    client = httpx.Client(transport=httpx.MockTransport(redirects))
+    url = "https://example.com/cross_domain"
+    headers = {"Cookie": "session=abc123"}
+    response = client.get(url, headers=headers, follow_redirects=True)
+    assert response.url == "https://example.org/cross_domain_target"
+    assert "cookie" not in response.json()["headers"]
+
+
+def test_cross_domain_redirect_strips_proxy_auth():
+    client = httpx.Client(transport=httpx.MockTransport(redirects))
+    url = "https://example.com/cross_domain"
+    headers = {"Proxy-Authorization": "Basic abc123"}
+    response = client.get(url, headers=headers, follow_redirects=True)
+    assert response.url == "https://example.org/cross_domain_target"
+    assert "proxy-authorization" not in response.json()["headers"]
+
+
+# --- Async mirrors ---
+
+
+@pytest.mark.anyio
+async def test_async_redirect_301():
+    async with httpx.AsyncClient(transport=httpx.MockTransport(redirects)) as client:
+        response = await client.post(
+            "https://example.org/redirect_301", follow_redirects=True
+        )
+        assert response.status_code == httpx.codes.OK
+        assert response.url == "https://example.org/"
+        assert len(response.history) == 1
+
+
+@pytest.mark.anyio
+async def test_async_redirect_302():
+    async with httpx.AsyncClient(transport=httpx.MockTransport(redirects)) as client:
+        response = await client.post(
+            "https://example.org/redirect_302", follow_redirects=True
+        )
+        assert response.status_code == httpx.codes.OK
+        assert response.url == "https://example.org/"
+        assert len(response.history) == 1
+
+
+@pytest.mark.anyio
+async def test_async_redirect_303():
+    async with httpx.AsyncClient(transport=httpx.MockTransport(redirects)) as client:
+        response = await client.get(
+            "https://example.org/redirect_303", follow_redirects=True
+        )
+        assert response.status_code == httpx.codes.OK
+        assert response.url == "https://example.org/"
+        assert len(response.history) == 1
+
+
+@pytest.mark.anyio
+async def test_async_head_redirect():
+    async with httpx.AsyncClient(transport=httpx.MockTransport(redirects)) as client:
+        response = await client.head(
+            "https://example.org/redirect_302", follow_redirects=True
+        )
+        assert response.status_code == httpx.codes.OK
+        assert response.url == "https://example.org/"
+        assert response.request.method == "HEAD"
+        assert len(response.history) == 1
+        assert response.text == ""
+
+
+@pytest.mark.anyio
+async def test_async_relative_redirect():
+    async with httpx.AsyncClient(transport=httpx.MockTransport(redirects)) as client:
+        response = await client.get(
+            "https://example.org/relative_redirect", follow_redirects=True
+        )
+        assert response.status_code == httpx.codes.OK
+        assert response.url == "https://example.org/"
+        assert len(response.history) == 1
+
+
+@pytest.mark.anyio
+async def test_async_no_scheme_redirect():
+    async with httpx.AsyncClient(transport=httpx.MockTransport(redirects)) as client:
+        response = await client.get(
+            "https://example.org/no_scheme_redirect", follow_redirects=True
+        )
+        assert response.status_code == httpx.codes.OK
+        assert response.url == "https://example.org/"
+        assert len(response.history) == 1
+
+
+@pytest.mark.anyio
+async def test_async_fragment_redirect():
+    async with httpx.AsyncClient(transport=httpx.MockTransport(redirects)) as client:
+        response = await client.get(
+            "https://example.org/relative_redirect#fragment", follow_redirects=True
+        )
+        assert response.status_code == httpx.codes.OK
+        assert response.url == "https://example.org/#fragment"
+        assert len(response.history) == 1
+
+
+@pytest.mark.anyio
+async def test_async_multiple_redirects():
+    async with httpx.AsyncClient(transport=httpx.MockTransport(redirects)) as client:
+        response = await client.get(
+            "https://example.org/multiple_redirects?count=20", follow_redirects=True
+        )
+        assert response.status_code == httpx.codes.OK
+        assert response.url == "https://example.org/multiple_redirects"
+        assert len(response.history) == 20
+        assert (
+            response.history[0].url
+            == "https://example.org/multiple_redirects?count=20"
+        )
+        assert (
+            response.history[1].url
+            == "https://example.org/multiple_redirects?count=19"
+        )
+        assert len(response.history[0].history) == 0
+        assert len(response.history[1].history) == 1
+
+
+@pytest.mark.anyio
+async def test_async_redirect_loop():
+    async with httpx.AsyncClient(transport=httpx.MockTransport(redirects)) as client:
+        with pytest.raises(httpx.TooManyRedirects):
+            await client.get(
+                "https://example.org/redirect_loop", follow_redirects=True
+            )
+
+
+@pytest.mark.anyio
+async def test_async_cross_domain_redirect_with_auth_header():
+    async with httpx.AsyncClient(transport=httpx.MockTransport(redirects)) as client:
+        url = "https://example.com/cross_domain"
+        headers = {"Authorization": "abc"}
+        response = await client.get(url, headers=headers, follow_redirects=True)
+        assert response.url == "https://example.org/cross_domain_target"
+        assert "authorization" not in response.json()["headers"]
+
+
+@pytest.mark.anyio
+async def test_async_same_domain_redirect():
+    async with httpx.AsyncClient(transport=httpx.MockTransport(redirects)) as client:
+        url = "https://example.org/cross_domain"
+        headers = {"Authorization": "abc"}
+        response = await client.get(url, headers=headers, follow_redirects=True)
+        assert response.url == "https://example.org/cross_domain_target"
+        assert response.json()["headers"]["authorization"] == "abc"
+
+
+@pytest.mark.anyio
+async def test_async_body_redirect():
+    async with httpx.AsyncClient(transport=httpx.MockTransport(redirects)) as client:
+        url = "https://example.org/redirect_body"
+        content = b"Example request body"
+        response = await client.post(url, content=content, follow_redirects=True)
+        assert response.url == "https://example.org/redirect_body_target"
+        assert response.json()["body"] == "Example request body"
+        assert "content-length" in response.json()["headers"]
+
+
+@pytest.mark.anyio
+async def test_async_no_body_redirect():
+    async with httpx.AsyncClient(transport=httpx.MockTransport(redirects)) as client:
+        url = "https://example.org/redirect_no_body"
+        content = b"Example request body"
+        response = await client.post(url, content=content, follow_redirects=True)
+        assert response.url == "https://example.org/redirect_body_target"
+        assert response.json()["body"] == ""
+        assert "content-length" not in response.json()["headers"]
+
+
+@pytest.mark.anyio
+async def test_async_redirect_cookie_behavior():
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(cookie_sessions), follow_redirects=True
+    ) as client:
+        response = await client.get("https://example.com/")
+        assert response.url == "https://example.com/"
+        assert response.text == "Not logged in"
+
+        response = await client.post("https://example.com/login")
+        assert response.url == "https://example.com/"
+        assert response.text == "Logged in"
+
+        response = await client.get("https://example.com/")
+        assert response.url == "https://example.com/"
+        assert response.text == "Logged in"
+
+        response = await client.post("https://example.com/logout")
+        assert response.url == "https://example.com/"
+        assert response.text == "Not logged in"
+
+        response = await client.get("https://example.com/")
+        assert response.url == "https://example.com/"
+        assert response.text == "Not logged in"
+
+
+@pytest.mark.anyio
+async def test_async_redirect_custom_scheme():
+    async with httpx.AsyncClient(transport=httpx.MockTransport(redirects)) as client:
+        with pytest.raises(httpx.UnsupportedProtocol) as e:
+            await client.post(
+                "https://example.org/redirect_custom_scheme", follow_redirects=True
+            )
+        assert str(e.value) == "Scheme 'market' not supported."
+
+
+@pytest.mark.anyio
+async def test_async_redirect_307():
+    async with httpx.AsyncClient(transport=httpx.MockTransport(redirects)) as client:
+        url = "https://example.org/redirect_307"
+        content = b"Example request body"
+        response = await client.post(url, content=content, follow_redirects=True)
+        assert response.url == "https://example.org/redirect_body_target"
+        assert response.json()["body"] == "Example request body"
+        assert "content-length" in response.json()["headers"]
+
+
+@pytest.mark.anyio
+async def test_async_cross_domain_redirect_strips_cookie():
+    async with httpx.AsyncClient(transport=httpx.MockTransport(redirects)) as client:
+        url = "https://example.com/cross_domain"
+        headers = {"Cookie": "session=abc123"}
+        response = await client.get(url, headers=headers, follow_redirects=True)
+        assert response.url == "https://example.org/cross_domain_target"
+        assert "cookie" not in response.json()["headers"]
+
+
+@pytest.mark.anyio
+async def test_async_cross_domain_redirect_strips_proxy_auth():
+    async with httpx.AsyncClient(transport=httpx.MockTransport(redirects)) as client:
+        url = "https://example.com/cross_domain"
+        headers = {"Proxy-Authorization": "Basic abc123"}
+        response = await client.get(url, headers=headers, follow_redirects=True)
+        assert response.url == "https://example.org/cross_domain_target"
+        assert "proxy-authorization" not in response.json()["headers"]

@@ -26,6 +26,7 @@ from ._exceptions import (
     TooManyRedirects,
     request_context,
 )
+from ._content import ByteStream
 from ._models import Cookies, Headers, Request, Response
 from ._status_codes import codes
 from ._transports.base import AsyncBaseTransport, BaseTransport
@@ -554,6 +555,7 @@ class BaseClient:
                 # Strip Authorization headers when responses are redirected
                 # away from the origin. (Except for direct HTTP to HTTPS redirects.)
                 headers.pop("Authorization", None)
+                headers.pop("Proxy-Authorization", None)
 
             # Update the Host header.
             headers["Host"] = url.netloc.decode("ascii")
@@ -578,6 +580,9 @@ class BaseClient:
         """
         if method != request.method and method == "GET":
             return None
+
+        if hasattr(request, "_content"):
+            return ByteStream(request._content)
 
         return request.stream
 
