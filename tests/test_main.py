@@ -185,3 +185,38 @@ def test_errors():
     assert splitlines(result.output) == [
         "UnsupportedProtocol: Request URL has an unsupported protocol 'invalid://'.",
     ]
+
+
+def test_download_with_gzip(server):
+    url = str(server.url.copy_with(path="/gzip"))
+    runner = CliRunner()
+    with runner.isolated_filesystem():
+        result = runner.invoke(httpx.main, [url, "--download", "output.txt"])
+        assert result.exit_code == 0
+        assert os.path.exists("output.txt")
+        with open("output.txt", "r") as input_file:
+            assert input_file.read() == "Hello, world! " * 100
+
+
+def test_verbose_redirect(server):
+    url = str(server.url.copy_with(path="/redirect_301"))
+    runner = CliRunner()
+    result = runner.invoke(httpx.main, [url, "-v", "--follow-redirects"])
+    assert result.exit_code == 0
+    lines = splitlines(result.output)
+    assert "* Redirecting to '/'" in lines
+    assert "HTTP/1.1 200 OK" in lines
+    assert "Hello, world!" in lines
+
+
+def test_download_redirect(server):
+    url = str(server.url.copy_with(path="/redirect_301"))
+    runner = CliRunner()
+    with runner.isolated_filesystem():
+        result = runner.invoke(
+            httpx.main, [url, "--download", "output.txt", "--follow-redirects"]
+        )
+        assert result.exit_code == 0
+        assert os.path.exists("output.txt")
+        with open("output.txt", "r") as input_file:
+            assert input_file.read() == "Hello, world!"

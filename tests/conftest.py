@@ -1,4 +1,5 @@
 import asyncio
+import gzip
 import json
 import os
 import threading
@@ -70,6 +71,8 @@ async def app(scope: Scope, receive: Receive, send: Send) -> None:
         await echo_headers(scope, receive, send)
     elif scope["path"].startswith("/redirect_301"):
         await redirect_301(scope, receive, send)
+    elif scope["path"].startswith("/gzip"):
+        await gzip_response(scope, receive, send)
     elif scope["path"].startswith("/json"):
         await hello_world_json(scope, receive, send)
     else:
@@ -180,6 +183,23 @@ async def redirect_301(scope: Scope, receive: Receive, send: Send) -> None:
         {"type": "http.response.start", "status": 301, "headers": [[b"location", b"/"]]}
     )
     await send({"type": "http.response.body"})
+
+
+async def gzip_response(scope: Scope, receive: Receive, send: Send) -> None:
+    body = b"Hello, world! " * 100
+    compressed = gzip.compress(body)
+    await send(
+        {
+            "type": "http.response.start",
+            "status": 200,
+            "headers": [
+                [b"content-type", b"text/plain"],
+                [b"content-encoding", b"gzip"],
+                [b"content-length", str(len(compressed)).encode()],
+            ],
+        }
+    )
+    await send({"type": "http.response.body", "body": compressed})
 
 
 @pytest.fixture(scope="session")

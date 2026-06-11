@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import functools
 import json
 import sys
 import typing
@@ -209,49 +208,88 @@ def format_certificate(cert: _PeerCertRetDictType) -> str:  # pragma: no cover
     return "\n".join(lines)
 
 
-def trace(
-    name: str, info: typing.Mapping[str, typing.Any], verbose: bool = False
-) -> None:
-    console = rich.console.Console()
-    if name == "connection.connect_tcp.started" and verbose:
-        host = info["host"]
-        console.print(f"* Connecting to {host!r}")
-    elif name == "connection.connect_tcp.complete" and verbose:
-        stream = info["return_value"]
-        server_addr = stream.get_extra_info("server_addr")
-        console.print(f"* Connected to {server_addr[0]!r} on port {server_addr[1]}")
-    elif name == "connection.start_tls.complete" and verbose:  # pragma: no cover
-        stream = info["return_value"]
-        ssl_object = stream.get_extra_info("ssl_object")
-        version = ssl_object.version()
-        cipher = ssl_object.cipher()
-        server_cert = ssl_object.getpeercert()
-        alpn = ssl_object.selected_alpn_protocol()
-        console.print(f"* SSL established using {version!r} / {cipher[0]!r}")
-        console.print(f"* Selected ALPN protocol: {alpn!r}")
-        if server_cert:
-            console.print("* Server certificate:")
-            console.print(format_certificate(server_cert))
-    elif name == "http11.send_request_headers.started" and verbose:
-        request = info["request"]
-        print_request_headers(request, http2=False)
-    elif name == "http2.send_request_headers.started" and verbose:  # pragma: no cover
-        request = info["request"]
-        print_request_headers(request, http2=True)
-    elif name == "http11.receive_response_headers.complete":
-        http_version, status, reason_phrase, headers = info["return_value"]
-        print_response_headers(http_version, status, reason_phrase, headers)
-    elif name == "http2.receive_response_headers.complete":  # pragma: no cover
-        status, headers = info["return_value"]
-        http_version = b"HTTP/2"
-        reason_phrase = None
-        print_response_headers(http_version, status, reason_phrase, headers)
+class TracePrinter:
+    def __init__(self, verbose: bool = False) -> None:
+        self.verbose = verbose
+
+    def _print_redirect(
+        self,
+        status: int,
+        headers: list[tuple[bytes, bytes]],
+    ) -> None:
+        if not self.verbose or not (300 <= status < 400):
+            return
+        location = next(
+            (value for name, value in headers if name.lower() == b"location"),
+            None,
+        )
+        if location is not None:
+            console = rich.console.Console()
+            console.print(
+                f"* Redirecting to {location.decode('ascii', errors='replace')!r}"
+            )
+
+    def __call__(
+        self, name: str, info: typing.Mapping[str, typing.Any]
+    ) -> None:
+        console = rich.console.Console()
+        if name == "connection.connect_tcp.started" and self.verbose:
+            host = info["host"]
+            console.print(f"* Connecting to {host!r}")
+        elif name == "connection.connect_tcp.complete" and self.verbose:
+            stream = info["return_value"]
+            server_addr = stream.get_extra_info("server_addr")
+            console.print(
+                f"* Connected to {server_addr[0]!r} on port {server_addr[1]}"
+            )
+        elif (
+            name == "connection.start_tls.complete" and self.verbose
+        ):  # pragma: no cover
+            stream = info["return_value"]
+            ssl_object = stream.get_extra_info("ssl_object")
+            version = ssl_object.version()
+            cipher = ssl_object.cipher()
+            server_cert = ssl_object.getpeercert()
+            alpn = ssl_object.selected_alpn_protocol()
+            console.print(f"* SSL established using {version!r} / {cipher[0]!r}")
+            console.print(f"* Selected ALPN protocol: {alpn!r}")
+            if server_cert:
+                console.print("* Server certificate:")
+                console.print(format_certificate(server_cert))
+        elif name == "http11.send_request_headers.started" and self.verbose:
+            request = info["request"]
+            print_request_headers(request, http2=False)
+        elif (
+            name == "http2.send_request_headers.started" and self.verbose
+        ):  # pragma: no cover
+            request = info["request"]
+            print_request_headers(request, http2=True)
+        elif name == "http11.receive_response_headers.complete":
+            http_version, status, reason_phrase, headers = info["return_value"]
+            print_response_headers(http_version, status, reason_phrase, headers)
+            self._print_redirect(status, headers)
+        elif name == "http2.receive_response_headers.complete":  # pragma: no cover
+            status, headers = info["return_value"]
+            http_version = b"HTTP/2"
+            reason_phrase = None
+            print_response_headers(http_version, status, reason_phrase, headers)
+            self._print_redirect(status, headers)
 
 
 def download_response(response: Response, download: typing.BinaryIO) -> None:
     console = rich.console.Console()
     console.print()
     content_length = response.headers.get("Content-Length")
+    content_encoding = response.headers.get("Content-Encoding")
+    has_encoding = content_encoding is not None and content_encoding != "identity"
+
+    if has_encoding or content_length is None:
+        total = 0
+        start = False
+    else:
+        total = int(content_length)
+        start = True
+
     with rich.progress.Progress(
         "[progress.description]{task.description}",
         "[progress.percentage]{task.percentage:>3.0f}%",
@@ -262,12 +300,14 @@ def download_response(response: Response, download: typing.BinaryIO) -> None:
         description = f"Downloading [bold]{rich.markup.escape(download.name)}"
         download_task = progress.add_task(
             description,
-            total=int(content_length or 0),
-            start=content_length is not None,
+            total=total,
+            start=start,
         )
+        bytes_written = 0
         for chunk in response.iter_bytes():
             download.write(chunk)
-            progress.update(download_task, completed=response.num_bytes_downloaded)
+            bytes_written += len(chunk)
+            progress.update(download_task, completed=bytes_written)
 
 
 def validate_json(
@@ -489,7 +529,7 @@ def main(
                 cookies=dict(cookies),
                 auth=auth,
                 follow_redirects=follow_redirects,
-                extensions={"trace": functools.partial(trace, verbose=verbose)},
+                extensions={"trace": TracePrinter(verbose=verbose)},
             ) as response:
                 if download is not None:
                     download_response(response, download)
