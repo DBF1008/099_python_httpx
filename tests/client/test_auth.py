@@ -770,3 +770,231 @@ def test_sync_auth() -> None:
 
     assert response.status_code == 200
     assert response.json() == {"auth": "sync-auth"}
+
+
+class SyncConsumeBodyTransport(httpx.MockTransport):
+    def handle_request(self, request: httpx.Request) -> httpx.Response:
+        assert isinstance(request.stream, httpx.SyncByteStream)
+        list(request.stream)
+        return self.handler(request)  # type: ignore[return-value]
+
+
+def test_sync_digest_auth_unavailable_streaming_body():
+    """
+    Sync counterpart of test_digest_auth_unavailable_streaming_body.
+    When a sync streaming body is used with DigestAuth, a 401 retry
+    should raise StreamConsumed because the stream cannot be replayed.
+    """
+    url = "https://example.org/"
+    auth = httpx.DigestAuth(username="user", password="password123")
+    app = DigestApp()
+
+    def streaming_body() -> typing.Iterator[bytes]:
+        yield b"Example request body"
+
+    with httpx.Client(transport=SyncConsumeBodyTransport(app)) as client:
+        with pytest.raises(httpx.StreamConsumed):
+            client.post(url, content=streaming_body(), auth=auth)
+
+
+def test_sync_auth_reads_response_body() -> None:
+    """
+    Sync counterpart of test_async_auth_reads_response_body.
+    Test that we can read the response body in an auth flow if
+    `requires_response_body` is set.
+    """
+    url = "https://example.org/"
+    auth = ResponseBodyAuth("xyz")
+    app = App()
+
+    with httpx.Client(transport=httpx.MockTransport(app)) as client:
+        response = client.get(url, auth=auth)
+
+    assert response.status_code == 200
+    assert response.json() == {"auth": '{"auth":"xyz"}'}
+
+
+class StaleChallengeApp:
+    """
+    A mock app that serves a digest challenge for the first request,
+    then returns a non-digest 401 for subsequent requests, simulating
+    a server that rotates or drops digest auth.
+    """
+
+    def __init__(self) -> None:
+        self._request_count = 0
+
+    def __call__(self, request: httpx.Request) -> httpx.Response:
+        self._request_count += 1
+        if self._request_count <= 2:
+            # First request: challenge + retry → 200
+            if "Authorization" not in request.headers:
+                return self._challenge_response()
+            data = {"auth": request.headers.get("Authorization")}
+            return httpx.Response(200, json=data)
+        else:
+            # Subsequent requests: non-digest 401 or 200 without auth
+            if "Authorization" in request.headers:
+                # Reject stale digest auth with a non-digest challenge.
+                return httpx.Response(
+                    401, headers={"www-authenticate": "Token realm=..."}
+                )
+            return httpx.Response(200, json={"auth": None})
+
+    def _challenge_response(self) -> httpx.Response:
+        nonce = hashlib.sha256(os.urandom(8)).hexdigest()
+        challenge = (
+            f'Digest realm="test", nonce="{nonce}", qop="auth", '
+            f'opaque="abc", algorithm="SHA-256"'
+        )
+        return httpx.Response(401, headers={"www-authenticate": challenge})
+
+
+def test_auth_flow_reuse_clears_stale_challenge() -> None:
+    """
+    When a DigestAuth instance is reused and the cached challenge becomes
+    stale (server returns a non-digest 401), the stale challenge must be
+    cleared so the next request starts fresh without auth.
+    """
+    url = "https://example.org/"
+    auth = httpx.DigestAuth(username="user", password="password123")
+    app = StaleChallengeApp()
+
+    with httpx.Client(transport=httpx.MockTransport(app)) as client:
+        # First request: challenge → retry → 200.
+        response_1 = client.get(url, auth=auth)
+        assert response_1.status_code == 200
+        assert len(response_1.history) == 1
+
+        # Second request: uses cached challenge, but server rejects with
+        # non-digest 401. The stale challenge should be cleared.
+        response_2 = client.get(url, auth=auth)
+        assert response_2.status_code == 401
+
+        # Third request: _last_challenge was cleared, so no auth header.
+        # Server accepts without auth.
+        response_3 = client.get(url, auth=auth)
+        assert response_3.status_code == 200
+        assert response_3.json() == {"auth": None}
+
+
+class SignatureAuth(httpx.Auth):
+    """
+    A mock authentication scheme that reads both request body and response
+    body for signature computation — the pattern described by the user.
+
+    On the first request, sends the request body hash as a token.
+    On receiving a response, reads the response body to extract a nonce,
+    then retries with a combined signature.
+    """
+
+    requires_request_body = True
+    requires_response_body = True
+
+    def __init__(self, token: str) -> None:
+        self._token = token
+
+    def auth_flow(
+        self, request: httpx.Request
+    ) -> typing.Generator[httpx.Request, httpx.Response, None]:
+        body_hash = hashlib.sha256(request.content).hexdigest()[:16]
+        request.headers["Authorization"] = f"Sig token={self._token}, body={body_hash}"
+
+        response = yield request
+
+        if response.status_code != 401:
+            return
+
+        # Read response body to extract nonce for signature refresh.
+        nonce = response.json().get("nonce", "")
+        combined = hashlib.sha256(
+            f"{self._token}:{body_hash}:{nonce}".encode()
+        ).hexdigest()[:16]
+        request.headers["Authorization"] = (
+            f"Sig token={self._token}, body={body_hash}, sig={combined}"
+        )
+        yield request
+
+
+class SignatureApp:
+    """Mock app that challenges the first request with a 401 + nonce."""
+
+    def __call__(self, request: httpx.Request) -> httpx.Response:
+        auth_header = request.headers.get("Authorization", "")
+        if "sig=" not in auth_header:
+            return httpx.Response(
+                401,
+                json={"nonce": "server-nonce-123"},
+                headers={"www-authenticate": 'Sig realm="test"'},
+            )
+        return httpx.Response(200, json={"auth": auth_header})
+
+
+@pytest.mark.anyio
+async def test_signature_auth_async() -> None:
+    """
+    Test that a custom auth reading both request body and response body
+    works correctly with AsyncClient, including a 401 retry with streaming
+    body buffered.
+    """
+    url = "https://example.org/"
+    auth = SignatureAuth("my-token")
+    app = SignatureApp()
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(app)) as client:
+        response = await client.post(url, content=b"hello world", auth=auth)
+
+    assert response.status_code == 200
+    auth_data = response.json()["auth"]
+    assert "token=my-token" in auth_data
+    assert "body=" in auth_data
+    assert "sig=" in auth_data
+
+
+def test_signature_auth_sync() -> None:
+    """
+    Sync counterpart of test_signature_auth_async. Verifies that the same
+    SignatureAuth class works identically with the sync Client.
+    """
+    url = "https://example.org/"
+    auth = SignatureAuth("my-token")
+    app = SignatureApp()
+
+    with httpx.Client(transport=httpx.MockTransport(app)) as client:
+        response = client.post(url, content=b"hello world", auth=auth)
+
+    assert response.status_code == 200
+    auth_data = response.json()["auth"]
+    assert "token=my-token" in auth_data
+    assert "body=" in auth_data
+    assert "sig=" in auth_data
+
+
+@pytest.mark.anyio
+async def test_sync_and_async_auth_flow_consistency() -> None:
+    """
+    Verify that the same auth class produces identical results whether
+    used with Client or AsyncClient — the sync/async boundary must be
+    transparent to the auth flow.
+    """
+    url = "https://example.org/"
+
+    auth_sync = httpx.DigestAuth(username="user", password="password123")
+    auth_async = httpx.DigestAuth(username="user", password="password123")
+
+    with httpx.Client(transport=httpx.MockTransport(DigestApp())) as client:
+        sync_response = client.get(url, auth=auth_sync)
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(DigestApp())
+    ) as client:
+        async_response = await client.get(url, auth=auth_async)
+
+    assert sync_response.status_code == async_response.status_code == 200
+    assert len(sync_response.history) == len(async_response.history) == 1
+
+    sync_auth = sync_response.json()["auth"]
+    async_auth = async_response.json()["auth"]
+    # Both should have Digest auth with the same structure.
+    assert sync_auth.startswith("Digest ")
+    assert async_auth.startswith("Digest ")

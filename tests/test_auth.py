@@ -306,3 +306,109 @@ def test_digest_auth_rfc_7616_sha_256(monkeypatch):
     response = httpx.Response(content=b"Hello, world!", status_code=200)
     with pytest.raises(StopIteration):
         flow.send(response)
+
+
+def test_digest_auth_clears_challenge_on_non_digest_401():
+    """
+    When a cached digest challenge becomes stale (server returns 401 without
+    a new Digest challenge), _last_challenge must be cleared so the next
+    request does not reuse the stale credentials.
+    """
+    auth = httpx.DigestAuth(username="user", password="pass")
+    request = httpx.Request("GET", "https://www.example.com")
+
+    # First request: no cached challenge, no auth header.
+    flow = auth.sync_auth_flow(request)
+    request = next(flow)
+    assert "Authorization" not in request.headers
+
+    # Server responds with 401 + Digest challenge.
+    headers = {
+        "WWW-Authenticate": 'Digest realm="...", qop="auth", nonce="abc", opaque="..."'
+    }
+    response = httpx.Response(
+        content=b"Auth required", status_code=401, headers=headers, request=request
+    )
+    request = flow.send(response)
+    assert request.headers["Authorization"].startswith("Digest")
+
+    # Retry succeeds.
+    response = httpx.Response(content=b"OK", status_code=200)
+    with pytest.raises(StopIteration):
+        flow.send(response)
+
+    # _last_challenge is now cached. Second request uses it proactively.
+    request2 = httpx.Request("GET", "https://www.example.com")
+    flow2 = auth.sync_auth_flow(request2)
+    request2 = next(flow2)
+    assert request2.headers["Authorization"].startswith("Digest")
+
+    # Server returns 401 with a non-digest challenge (e.g. Token auth).
+    headers2 = {"WWW-Authenticate": "Token ..."}
+    response2 = httpx.Response(
+        content=b"Auth required", status_code=401, headers=headers2, request=request2
+    )
+    # Auth flow should end without retrying (no digest challenge found).
+    with pytest.raises(StopIteration):
+        flow2.send(response2)
+
+    # _last_challenge must be cleared so the third request starts fresh.
+    assert auth._last_challenge is None
+
+    request3 = httpx.Request("GET", "https://www.example.com")
+    flow3 = auth.sync_auth_flow(request3)
+    request3 = next(flow3)
+    assert "Authorization" not in request3.headers
+
+    # Cleanup the generator.
+    response3 = httpx.Response(content=b"OK", status_code=200)
+    with pytest.raises(StopIteration):
+        flow3.send(response3)
+
+
+@pytest.mark.anyio
+async def test_digest_auth_async_flow_equivalent():
+    """
+    Verify that async_auth_flow produces the same request/response sequence
+    as sync_auth_flow for DigestAuth.
+    """
+    auth_sync = httpx.DigestAuth(username="user", password="pass")
+    auth_async = httpx.DigestAuth(username="user", password="pass")
+    request_sync = httpx.Request("GET", "https://www.example.com")
+    request_async = httpx.Request("GET", "https://www.example.com")
+
+    # --- sync path ---
+    sync_flow = auth_sync.sync_auth_flow(request_sync)
+    sync_request = next(sync_flow)
+    assert "Authorization" not in sync_request.headers
+
+    headers = {
+        "WWW-Authenticate": 'Digest realm="...", qop="auth", nonce="...", opaque="..."'
+    }
+    sync_response_401 = httpx.Response(
+        content=b"Auth required", status_code=401, headers=headers, request=sync_request
+    )
+    sync_retry_request = sync_flow.send(sync_response_401)
+    assert sync_retry_request.headers["Authorization"].startswith("Digest")
+
+    sync_response_200 = httpx.Response(content=b"OK", status_code=200)
+    with pytest.raises(StopIteration):
+        sync_flow.send(sync_response_200)
+
+    # --- async path ---
+    async_flow = auth_async.async_auth_flow(request_async)
+    async_request = await async_flow.__anext__()
+    assert "Authorization" not in async_request.headers
+
+    async_response_401 = httpx.Response(
+        content=b"Auth required",
+        status_code=401,
+        headers=headers,
+        request=async_request,
+    )
+    async_retry_request = await async_flow.asend(async_response_401)
+    assert async_retry_request.headers["Authorization"].startswith("Digest")
+
+    async_response_200 = httpx.Response(content=b"OK", status_code=200)
+    with pytest.raises(StopAsyncIteration):
+        await async_flow.asend(async_response_200)

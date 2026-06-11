@@ -35,6 +35,11 @@ class Auth:
     requires_request_body = False
     requires_response_body = False
 
+    def _build_auth_header(self, username: str | bytes, password: str | bytes) -> str:
+        userpass = b":".join((to_bytes(username), to_bytes(password)))
+        token = b64encode(userpass).decode()
+        return f"Basic {token}"
+
     def auth_flow(self, request: Request) -> typing.Generator[Request, Response, None]:
         """
         Execute the authentication flow.
@@ -72,17 +77,20 @@ class Auth:
             request.read()
 
         flow = self.auth_flow(request)
-        request = next(flow)
+        try:
+            request = next(flow)
 
-        while True:
-            response = yield request
-            if self.requires_response_body:
-                response.read()
+            while True:
+                response = yield request
+                if self.requires_response_body:
+                    response.read()
 
-            try:
-                request = flow.send(response)
-            except StopIteration:
-                break
+                try:
+                    request = flow.send(response)
+                except StopIteration:
+                    break
+        finally:
+            flow.close()
 
     async def async_auth_flow(
         self, request: Request
@@ -97,17 +105,20 @@ class Auth:
             await request.aread()
 
         flow = self.auth_flow(request)
-        request = next(flow)
+        try:
+            request = next(flow)
 
-        while True:
-            response = yield request
-            if self.requires_response_body:
-                await response.aread()
+            while True:
+                response = yield request
+                if self.requires_response_body:
+                    await response.aread()
 
-            try:
-                request = flow.send(response)
-            except StopIteration:
-                break
+                try:
+                    request = flow.send(response)
+                except StopIteration:
+                    break
+        finally:
+            flow.close()
 
 
 class FunctionAuth(Auth):
@@ -130,16 +141,14 @@ class BasicAuth(Auth):
     """
 
     def __init__(self, username: str | bytes, password: str | bytes) -> None:
-        self._auth_header = self._build_auth_header(username, password)
+        self._username = username
+        self._password = password
 
     def auth_flow(self, request: Request) -> typing.Generator[Request, Response, None]:
-        request.headers["Authorization"] = self._auth_header
+        request.headers["Authorization"] = self._build_auth_header(
+            self._username, self._password
+        )
         yield request
-
-    def _build_auth_header(self, username: str | bytes, password: str | bytes) -> str:
-        userpass = b":".join((to_bytes(username), to_bytes(password)))
-        token = b64encode(userpass).decode()
-        return f"Basic {token}"
 
 
 class NetRCAuth(Auth):
@@ -165,11 +174,6 @@ class NetRCAuth(Auth):
                 username=auth_info[0], password=auth_info[2]
             )
             yield request
-
-    def _build_auth_header(self, username: str | bytes, password: str | bytes) -> str:
-        userpass = b":".join((to_bytes(username), to_bytes(password)))
-        token = b64encode(userpass).decode()
-        return f"Basic {token}"
 
 
 class DigestAuth(Auth):
@@ -202,6 +206,11 @@ class DigestAuth(Auth):
             # If the response is not a 401 then we don't
             # need to build an authenticated request.
             return
+
+        # Always clear the cached challenge on a 401 response, to prevent
+        # stale challenge state from leaking into subsequent requests.
+        # If a new Digest challenge is found below, it will be re-cached.
+        self._last_challenge = None
 
         for auth_header in response.headers.get_list("www-authenticate"):
             if auth_header.lower().startswith("digest "):
