@@ -126,6 +126,16 @@ def format_request_headers(request: httpcore.Request, http2: bool = False) -> st
     return "\n".join(lines)
 
 
+def format_httpx_request_headers(request: Request) -> str:
+    """Format an httpx Request's headers for CLI display."""
+    method = request.method
+    target = request.url.raw_path.decode("ascii")
+    lines = [f"{method} {target} HTTP/1.1"] + [
+        f"{name}: {value}" for name, value in request.headers.items()
+    ]
+    return "\n".join(lines)
+
+
 def format_response_headers(
     http_version: bytes,
     status: int,
@@ -165,6 +175,62 @@ def print_response_headers(
     console.print(syntax)
     syntax = rich.syntax.Syntax("", "http", theme="ansi_dark", word_wrap=True)
     console.print(syntax)
+
+
+def print_response_info(response: Response, verbose: bool = False) -> None:
+    """
+    Print response headers (and optionally request headers for the redirect chain)
+    for CLI display. This replaces the old approach of printing response headers
+    inside the trace callback, giving us proper control over what gets shown
+    for redirect chains and compressed responses.
+
+    Responsibilities:
+    - In verbose mode: show the full redirect chain (request + response headers)
+    - Always: show the final response headers
+    - Does NOT show response body (that's print_response's job)
+    """
+    console = rich.console.Console()
+
+    if verbose:
+        # Print request and response headers for each redirect in the chain.
+        for history_response in response.history:
+            console.print(
+                f"> [bold]{history_response.request.method}[/bold] "
+                f"{history_response.url}"
+            )
+            request_text = format_httpx_request_headers(history_response.request)
+            syntax = rich.syntax.Syntax(
+                request_text, "http", theme="ansi_dark", word_wrap=True
+            )
+            console.print(syntax)
+            console.print()
+
+            status = history_response.status_code
+            reason = history_response.extensions.get("reason_phrase")
+            if reason is None:
+                reason = codes.get_reason_phrase(status).encode("ascii")
+            http_version = history_response.extensions.get(
+                "http_version", b"HTTP/1.1"
+            )
+            print_response_headers(
+                http_version,
+                status,
+                reason,
+                history_response.headers.raw,
+            )
+
+    # Print final response headers.
+    status = response.status_code
+    reason = response.extensions.get("reason_phrase")
+    if reason is None:
+        reason = codes.get_reason_phrase(status).encode("ascii")
+    http_version = response.extensions.get("http_version", b"HTTP/1.1")
+    print_response_headers(
+        http_version,
+        status,
+        reason,
+        response.headers.raw,
+    )
 
 
 def print_response(response: Response) -> None:
@@ -212,6 +278,17 @@ def format_certificate(cert: _PeerCertRetDictType) -> str:  # pragma: no cover
 def trace(
     name: str, info: typing.Mapping[str, typing.Any], verbose: bool = False
 ) -> None:
+    """
+    Low-level network trace callback for httpcore events.
+
+    Responsibilities:
+    - Connection lifecycle info (TCP connect, TLS handshake) — verbose only
+    - Request header display — verbose only
+
+    Response header display is NOT handled here. It's done explicitly in main()
+    via print_response_info() so that redirect chains and compressed responses
+    are displayed correctly and consistently.
+    """
     console = rich.console.Console()
     if name == "connection.connect_tcp.started" and verbose:
         host = info["host"]
@@ -238,20 +315,28 @@ def trace(
     elif name == "http2.send_request_headers.started" and verbose:  # pragma: no cover
         request = info["request"]
         print_request_headers(request, http2=True)
-    elif name == "http11.receive_response_headers.complete":
-        http_version, status, reason_phrase, headers = info["return_value"]
-        print_response_headers(http_version, status, reason_phrase, headers)
-    elif name == "http2.receive_response_headers.complete":  # pragma: no cover
-        status, headers = info["return_value"]
-        http_version = b"HTTP/2"
-        reason_phrase = None
-        print_response_headers(http_version, status, reason_phrase, headers)
 
 
 def download_response(response: Response, download: typing.BinaryIO) -> None:
-    console = rich.console.Console()
-    console.print()
+    """
+    Stream the response body to a file, showing a progress bar.
+
+    Progress tracking strategy:
+    - Track bytes actually written to disk (decompressed).
+    - When Content-Length is present AND the response is not compressed,
+      use it as the progress total for an accurate percentage.
+    - Otherwise, show an indeterminate progress bar (bytes written so far,
+      no percentage) since we can't know the decompressed size upfront.
+
+    This avoids the old bug where num_bytes_downloaded (raw compressed bytes
+    from the wire) was compared against Content-Length (also compressed) while
+    the file received decompressed bytes, causing the progress bar to disagree
+    with the saved file size.
+    """
     content_length = response.headers.get("Content-Length")
+    has_encoding = "Content-Encoding" in response.headers
+    can_track = content_length is not None and not has_encoding
+
     with rich.progress.Progress(
         "[progress.description]{task.description}",
         "[progress.percentage]{task.percentage:>3.0f}%",
@@ -262,12 +347,14 @@ def download_response(response: Response, download: typing.BinaryIO) -> None:
         description = f"Downloading [bold]{rich.markup.escape(download.name)}"
         download_task = progress.add_task(
             description,
-            total=int(content_length or 0),
-            start=content_length is not None,
+            total=int(content_length) if can_track else None,
+            start=can_track,
         )
+        written = 0
         for chunk in response.iter_bytes():
             download.write(chunk)
-            progress.update(download_task, completed=response.num_bytes_downloaded)
+            written += len(chunk)
+            progress.update(download_task, completed=written)
 
 
 def validate_json(
@@ -491,6 +578,7 @@ def main(
                 follow_redirects=follow_redirects,
                 extensions={"trace": functools.partial(trace, verbose=verbose)},
             ) as response:
+                print_response_info(response, verbose=verbose)
                 if download is not None:
                     download_response(response, download)
                 else:
