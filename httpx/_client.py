@@ -232,9 +232,9 @@ class BaseClient:
         return self._trust_env
 
     def _enforce_trailing_slash(self, url: URL) -> URL:
-        if url.raw_path.endswith(b"/"):
+        if url._uri_reference.path.endswith("/"):
             return url
-        return url.copy_with(raw_path=url.raw_path + b"/")
+        return url.copy_with(path=url._uri_reference.path + "/")
 
     def _get_proxy_map(
         self, proxy: ProxyTypes | None, allow_env_proxies: bool
@@ -375,6 +375,16 @@ class BaseClient:
                 else Timeout(timeout)
             )
             extensions = dict(**extensions, timeout=timeout.as_dict())
+        # If the (possibly base-URL-merged) URL carries its own query string
+        # and we also have params to apply, fold the URL query into params so
+        # that Request's `URL(url, params=...)` — which *replaces* the query —
+        # does not discard the URL-level parameters.  Per-request params take
+        # precedence over URL params, which take precedence over client params
+        # (already merged above via _merge_queryparams).
+        if url.query and params is not None:
+            url_params = QueryParams(url.query)
+            params = url_params.merge(params)
+            url = url.copy_with(query=b"")
         return Request(
             method,
             url,
@@ -392,6 +402,10 @@ class BaseClient:
         """
         Merge a URL argument together with any 'base_url' on the client,
         to create the URL used for the outgoing request.
+
+        Merges paths by appending the relative URL's path to the base URL's
+        path. Query strings and fragments from the relative URL override those
+        of the base URL; when absent they are inherited from the base URL.
         """
         merge_url = URL(url)
         if merge_url.is_relative_url:
@@ -406,8 +420,32 @@ class BaseClient:
             # URL('https://www.example.com/subpath/')
             # >>> client.build_request("GET", "/path").url
             # URL('https://www.example.com/subpath/path')
-            merge_raw_path = self.base_url.raw_path + merge_url.raw_path.lstrip(b"/")
-            return self.base_url.copy_with(raw_path=merge_raw_path)
+            #
+            # We merge path, query, and fragment independently. Using
+            # `raw_path` (which bundles path + query) would mangle the query
+            # string when both the base and relative URLs have one, because
+            # the concatenation introduces a second '?' that gets treated as
+            # literal path content rather than a query separator.
+            base_url = self.base_url
+            base_path = base_url._uri_reference.path or "/"
+            merge_path = merge_url._uri_reference.path or ""
+            merged = base_url.copy_with(path=base_path + merge_path.lstrip("/"))
+
+            # If the relative URL provides a query string (including an empty
+            # one, i.e. a trailing '?'), it replaces the base URL's query.
+            # copy_with(query=...) requires bytes.
+            if merge_url._uri_reference.query is not None:
+                merged = merged.copy_with(
+                    query=merge_url._uri_reference.query.encode("ascii")
+                )
+
+            # If the relative URL provides a fragment, it replaces the base
+            # URL's fragment. We use the decoded `fragment` property to avoid
+            # double percent-encoding (FRAG_SAFE does not include '%').
+            if "#" in str(merge_url):
+                merged = merged.copy_with(fragment=merge_url.fragment)
+
+            return merged
         return merge_url
 
     def _merge_cookies(self, cookies: CookieTypes | None = None) -> CookieTypes | None:
@@ -517,6 +555,12 @@ class BaseClient:
     def _redirect_url(self, request: Request, response: Response) -> URL:
         """
         Return the URL for the redirect to follow.
+
+        Uses standard RFC 3986 resolution via ``URL.join()`` for relative
+        Location headers (unlike ``_merge_url`` which always appends to the
+        base path). Query and fragment handling is consistent with
+        ``_merge_url``: the redirect target's query/fragment wins; if absent,
+        the fragment is inherited from the previous request (RFC 7231 7.1.2).
         """
         location = response.headers["Location"]
 
@@ -534,6 +578,11 @@ class BaseClient:
 
         # Facilitate relative 'Location' headers, as allowed by RFC 7231.
         # (e.g. '/path/to/resource' instead of 'http://domain.tld/path/to/resource')
+        #
+        # URL.join() delegates to urllib.parse.urljoin() which performs
+        # standard RFC 3986 reference resolution — the query string and
+        # fragment from the Location header replace those of the request URL,
+        # matching the semantics used in _merge_url.
         if url.is_relative_url:
             url = request.url.join(url)
 

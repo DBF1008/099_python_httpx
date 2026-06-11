@@ -229,6 +229,52 @@ def test_merge_relative_url_with_encoded_slashes():
     assert request.url == "https://www.example.com/base%2Fpath/testing"
 
 
+def test_merge_relative_url_with_query_string():
+    client = httpx.Client(base_url="https://www.example.com/api/")
+    request = client.build_request("GET", "endpoint?q=1")
+    assert request.url == "https://www.example.com/api/endpoint?q=1"
+
+
+def test_merge_relative_url_with_fragment():
+    client = httpx.Client(base_url="https://www.example.com/api/")
+    request = client.build_request("GET", "endpoint#section")
+    assert request.url == "https://www.example.com/api/endpoint#section"
+
+
+def test_merge_relative_url_with_query_and_fragment():
+    client = httpx.Client(base_url="https://www.example.com/api/")
+    request = client.build_request("GET", "endpoint?q=1#section")
+    assert request.url == "https://www.example.com/api/endpoint?q=1#section"
+
+
+def test_merge_relative_url_with_base_query_overridden():
+    # When the relative URL has its own query, it replaces the base URL's query.
+    client = httpx.Client(base_url="https://www.example.com/api/?v=1")
+    request = client.build_request("GET", "endpoint?q=1")
+    assert request.url == "https://www.example.com/api/endpoint?q=1"
+
+
+def test_merge_relative_url_preserves_base_query():
+    # When the relative URL has no query, the base URL's query is preserved.
+    client = httpx.Client(base_url="https://www.example.com/api/?v=1")
+    request = client.build_request("GET", "endpoint")
+    assert request.url == "https://www.example.com/api/endpoint?v=1"
+
+
+def test_merge_relative_url_preserves_base_fragment():
+    # When the relative URL has no fragment, the base URL's fragment is preserved.
+    client = httpx.Client(base_url="https://www.example.com/api/#basefrag")
+    request = client.build_request("GET", "endpoint")
+    assert request.url == "https://www.example.com/api/endpoint#basefrag"
+
+
+def test_merge_relative_url_fragment_overrides_base():
+    # When the relative URL has a fragment, it overrides the base URL's fragment.
+    client = httpx.Client(base_url="https://www.example.com/api/#basefrag")
+    request = client.build_request("GET", "endpoint#newfrag")
+    assert request.url == "https://www.example.com/api/endpoint#newfrag"
+
+
 def test_context_managed_transport():
     class Transport(httpx.BaseTransport):
         def __init__(self) -> None:

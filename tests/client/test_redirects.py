@@ -107,6 +107,25 @@ def redirects(request: httpx.Request) -> httpx.Response:
         headers = {"location": "market://details?id=42"}
         return httpx.Response(status_code, headers=headers)
 
+    elif request.url.path == "/redirect_with_query":
+        status_code = httpx.codes.SEE_OTHER
+        headers = {"location": "/target?redirected=1"}
+        return httpx.Response(status_code, headers=headers)
+
+    elif request.url.path == "/redirect_with_query_and_fragment":
+        status_code = httpx.codes.SEE_OTHER
+        headers = {"location": "/target?q=1#section"}
+        return httpx.Response(status_code, headers=headers)
+
+    elif request.url.path == "/target":
+        status_code = httpx.codes.OK
+        data = {
+            "url": str(request.url),
+            "path": request.url.path,
+            "query": request.url.query.decode("ascii"),
+        }
+        return httpx.Response(status_code, json=data)
+
     if request.method == "HEAD":
         return httpx.Response(200)
 
@@ -445,3 +464,86 @@ async def test_async_invalid_redirect():
             await client.get(
                 "http://example.org/invalid_redirect", follow_redirects=True
             )
+
+
+def test_redirect_url_with_query_in_location():
+    """
+    When a redirect Location header includes a query string, the redirect
+    URL should preserve it.
+    """
+    client = httpx.Client(transport=httpx.MockTransport(redirects))
+    response = client.get(
+        "https://example.org/redirect_with_query", follow_redirects=True
+    )
+    assert response.url == "https://example.org/target?redirected=1"
+    assert response.status_code == httpx.codes.OK
+
+
+def test_redirect_url_with_query_and_fragment_in_location():
+    """
+    When a redirect Location header includes both query and fragment,
+    both should be preserved in the redirect URL.
+    """
+    client = httpx.Client(transport=httpx.MockTransport(redirects))
+    response = client.get(
+        "https://example.org/redirect_with_query_and_fragment",
+        follow_redirects=True,
+    )
+    assert response.url == "https://example.org/target?q=1#section"
+    assert response.status_code == httpx.codes.OK
+
+
+def test_redirect_preserves_fragment_from_original_request():
+    """
+    When the original request has a fragment and the redirect Location does not,
+    the fragment is preserved (RFC 7231 7.1.2).
+    """
+    client = httpx.Client(transport=httpx.MockTransport(redirects))
+    response = client.get(
+        "https://example.org/redirect_with_query#original",
+        follow_redirects=True,
+    )
+    # Location is "/target?redirected=1" — no fragment, so original is preserved
+    assert response.url == "https://example.org/target?redirected=1#original"
+
+
+def test_redirect_request_hook_url_consistency():
+    """
+    The URL seen by request hooks must match the URL actually sent.
+    This is critical for debugging redirect chains.
+    """
+    seen_urls: list[str] = []
+
+    def request_hook(request: httpx.Request) -> None:
+        seen_urls.append(str(request.url))
+
+    client = httpx.Client(
+        transport=httpx.MockTransport(redirects),
+        event_hooks={"request": [request_hook]},
+    )
+    response = client.get(
+        "https://example.org/redirect_with_query", follow_redirects=True
+    )
+    # First hook call: original request URL
+    assert seen_urls[0] == "https://example.org/redirect_with_query"
+    # Second hook call: redirect target URL (must match response.url)
+    assert seen_urls[1] == str(response.url)
+    assert seen_urls[1] == "https://example.org/target?redirected=1"
+
+
+def test_redirect_with_base_url_and_relative_location():
+    """
+    When using base_url, a relative redirect Location should resolve
+    correctly against the current request URL (not the base_url).
+    """
+    client = httpx.Client(
+        transport=httpx.MockTransport(redirects),
+        base_url="https://example.org/api/",
+    )
+    response = client.get(
+        "https://example.org/redirect_with_query", follow_redirects=True
+    )
+    # The redirect Location "/target?redirected=1" resolves against
+    # the request URL "https://example.org/redirect_with_query",
+    # producing "https://example.org/target?redirected=1"
+    assert response.url == "https://example.org/target?redirected=1"
