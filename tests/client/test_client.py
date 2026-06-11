@@ -229,6 +229,32 @@ def test_merge_relative_url_with_encoded_slashes():
     assert request.url == "https://www.example.com/base%2Fpath/testing"
 
 
+def test_merge_relative_url_with_fragment():
+    client = httpx.Client(base_url="https://www.example.com/api/")
+    request = client.build_request("GET", "/users#section")
+    assert request.url == "https://www.example.com/api/users#section"
+    assert request.url.fragment == "section"
+
+
+def test_merge_relative_url_with_query_and_fragment():
+    client = httpx.Client(base_url="https://www.example.com/api/")
+    request = client.build_request("GET", "/users?page=1#section")
+    assert request.url.fragment == "section"
+    assert request.url.params["page"] == "1"
+
+
+def test_merge_relative_url_base_url_fragment_not_preserved():
+    client = httpx.Client(base_url="https://www.example.com/api/#basefrag")
+    request = client.build_request("GET", "/users")
+    assert request.url.fragment == ""
+
+
+def test_merge_relative_url_fragment_overrides_base_url_fragment():
+    client = httpx.Client(base_url="https://www.example.com/api/#basefrag")
+    request = client.build_request("GET", "/users#myfrag")
+    assert request.url.fragment == "myfrag"
+
+
 def test_context_managed_transport():
     class Transport(httpx.BaseTransport):
         def __init__(self) -> None:

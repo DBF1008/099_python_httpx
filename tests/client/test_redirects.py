@@ -445,3 +445,67 @@ async def test_async_invalid_redirect():
             await client.get(
                 "http://example.org/invalid_redirect", follow_redirects=True
             )
+
+
+def test_redirect_preserves_fragment_from_initial_request():
+    client = httpx.Client(transport=httpx.MockTransport(redirects))
+    response = client.get(
+        "https://example.org/relative_redirect#section", follow_redirects=True
+    )
+    assert response.status_code == httpx.codes.OK
+    assert response.url.fragment == "section"
+
+
+def test_redirect_fragment_with_base_url():
+    client = httpx.Client(
+        base_url="https://example.org",
+        transport=httpx.MockTransport(redirects),
+    )
+    response = client.get("/relative_redirect#section", follow_redirects=True)
+    assert response.status_code == httpx.codes.OK
+    assert response.url.fragment == "section"
+
+
+def test_redirect_location_fragment_takes_precedence():
+    def fragment_redirect(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/start":
+            return httpx.Response(
+                httpx.codes.SEE_OTHER,
+                headers={"location": "/end#from_redirect"},
+            )
+        return httpx.Response(200, text="ok")
+
+    client = httpx.Client(transport=httpx.MockTransport(fragment_redirect))
+    response = client.get(
+        "https://example.org/start#original", follow_redirects=True
+    )
+    assert response.url.fragment == "from_redirect"
+
+
+def test_redirect_url_consistent_with_build_request_url():
+    urls_seen: list[httpx.URL] = []
+
+    def tracking_redirect(request: httpx.Request) -> httpx.Response:
+        urls_seen.append(request.url)
+        if request.url.path == "/api/start":
+            return httpx.Response(
+                httpx.codes.SEE_OTHER,
+                headers={"location": "/api/end"},
+            )
+        return httpx.Response(200, text="ok")
+
+    client = httpx.Client(
+        base_url="https://example.org/",
+        transport=httpx.MockTransport(tracking_redirect),
+        params={"token": "abc"},
+    )
+    response = client.get("/api/start?page=1#section", follow_redirects=True)
+    assert response.status_code == 200
+
+    initial_url = urls_seen[0]
+    assert initial_url.fragment == "section"
+    assert initial_url.params["token"] == "abc"
+    assert initial_url.params["page"] == "1"
+
+    redirect_url = urls_seen[1]
+    assert redirect_url.fragment == "section"

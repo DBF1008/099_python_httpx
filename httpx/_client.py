@@ -367,6 +367,8 @@ class BaseClient:
         headers = self._merge_headers(headers)
         cookies = self._merge_cookies(cookies)
         params = self._merge_queryparams(params)
+        if params is not None and url.params:
+            params = url.params.merge(params)
         extensions = {} if extensions is None else extensions
         if "timeout" not in extensions:
             timeout = (
@@ -407,7 +409,10 @@ class BaseClient:
             # >>> client.build_request("GET", "/path").url
             # URL('https://www.example.com/subpath/path')
             merge_raw_path = self.base_url.raw_path + merge_url.raw_path.lstrip(b"/")
-            return self.base_url.copy_with(raw_path=merge_raw_path)
+            return self.base_url.copy_with(
+                raw_path=merge_raw_path,
+                fragment=merge_url._uri_reference.fragment,
+            )
         return merge_url
 
     def _merge_cookies(self, cookies: CookieTypes | None = None) -> CookieTypes | None:
