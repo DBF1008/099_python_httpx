@@ -306,3 +306,77 @@ def test_digest_auth_rfc_7616_sha_256(monkeypatch):
     response = httpx.Response(content=b"Hello, world!", status_code=200)
     with pytest.raises(StopIteration):
         flow.send(response)
+
+
+@pytest.mark.anyio
+async def test_digest_auth_with_401_async():
+    auth = httpx.DigestAuth(username="user", password="pass")
+    request = httpx.Request("GET", "https://www.example.com")
+
+    flow = auth.async_auth_flow(request)
+    request = await flow.__anext__()
+    assert "Authorization" not in request.headers
+
+    headers = {
+        "WWW-Authenticate": 'Digest realm="...", qop="auth", nonce="...", opaque="..."'
+    }
+    response = httpx.Response(
+        content=b"Auth required", status_code=401, headers=headers, request=request
+    )
+    request = await flow.asend(response)
+    assert request.headers["Authorization"].startswith("Digest")
+
+    response = httpx.Response(content=b"Hello, world!", status_code=200)
+    with pytest.raises(StopAsyncIteration):
+        await flow.asend(response)
+
+
+@pytest.mark.anyio
+async def test_digest_auth_sync_async_parity(monkeypatch):
+    def mock_get_client_nonce(nonce_count: int, nonce: bytes) -> bytes:
+        return b"fixed_cnonce_val"
+
+    auth = httpx.DigestAuth(username="user", password="pass")
+    monkeypatch.setattr(auth, "_get_client_nonce", mock_get_client_nonce)
+
+    headers_401 = {
+        "WWW-Authenticate": 'Digest realm="...", qop="auth", nonce="...", opaque="..."'
+    }
+
+    # Drive sync_auth_flow
+    request_sync = httpx.Request("GET", "https://www.example.com")
+    sync_flow = auth.sync_auth_flow(request_sync)
+    request_sync = next(sync_flow)
+    response_401 = httpx.Response(
+        content=b"Auth required",
+        status_code=401,
+        headers=headers_401,
+        request=request_sync,
+    )
+    request_sync = sync_flow.send(response_401)
+    sync_auth_header = request_sync.headers["Authorization"]
+    response_200 = httpx.Response(content=b"OK", status_code=200)
+    with pytest.raises(StopIteration):
+        sync_flow.send(response_200)
+
+    # Reset state for async path
+    auth._last_challenge = None
+    auth._nonce_count = 1
+
+    # Drive async_auth_flow
+    request_async = httpx.Request("GET", "https://www.example.com")
+    async_flow = auth.async_auth_flow(request_async)
+    request_async = await async_flow.__anext__()
+    response_401 = httpx.Response(
+        content=b"Auth required",
+        status_code=401,
+        headers=headers_401,
+        request=request_async,
+    )
+    request_async = await async_flow.asend(response_401)
+    async_auth_header = request_async.headers["Authorization"]
+    response_200 = httpx.Response(content=b"OK", status_code=200)
+    with pytest.raises(StopAsyncIteration):
+        await async_flow.asend(response_200)
+
+    assert sync_auth_header == async_auth_header

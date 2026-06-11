@@ -692,18 +692,42 @@ class ConsumeBodyTransport(httpx.MockTransport):
         return self.handler(request)  # type: ignore[return-value]
 
 
+class SyncConsumeBodyTransport(httpx.MockTransport):
+    def handle_request(self, request: httpx.Request) -> httpx.Response:
+        assert isinstance(request.stream, httpx.SyncByteStream)
+        list(request.stream)
+        return self.handler(request)  # type: ignore[return-value]
+
+
 @pytest.mark.anyio
-async def test_digest_auth_unavailable_streaming_body():
+async def test_digest_auth_streaming_body():
     url = "https://example.org/"
     auth = httpx.DigestAuth(username="user", password="password123")
     app = DigestApp()
 
     async def streaming_body() -> typing.AsyncIterator[bytes]:
-        yield b"Example request body"  # pragma: no cover
+        yield b"Example request body"
 
     async with httpx.AsyncClient(transport=ConsumeBodyTransport(app)) as client:
-        with pytest.raises(httpx.StreamConsumed):
-            await client.post(url, content=streaming_body(), auth=auth)
+        response = await client.post(url, content=streaming_body(), auth=auth)
+
+    assert response.status_code == 200
+    assert len(response.history) == 1
+
+
+def test_sync_digest_auth_streaming_body():
+    url = "https://example.org/"
+    auth = httpx.DigestAuth(username="user", password="password123")
+    app = DigestApp()
+
+    def streaming_body() -> typing.Iterator[bytes]:
+        yield b"Example request body"
+
+    with httpx.Client(transport=SyncConsumeBodyTransport(app)) as client:
+        response = client.post(url, content=streaming_body(), auth=auth)
+
+    assert response.status_code == 200
+    assert len(response.history) == 1
 
 
 @pytest.mark.anyio
@@ -770,3 +794,60 @@ def test_sync_auth() -> None:
 
     assert response.status_code == 200
     assert response.json() == {"auth": "sync-auth"}
+
+
+@pytest.mark.anyio
+async def test_digest_auth_reuse_state_consistency() -> None:
+    url = "https://example.org/"
+    auth = httpx.DigestAuth(username="user", password="password123")
+    app = DigestApp(regenerate_nonce=False)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(app)) as client:
+        r1 = await client.get(url, auth=auth)
+        assert r1.status_code == 200
+        assert len(r1.history) == 1
+
+        nc1 = parse_keqv_list(r1.request.headers["Authorization"].split(", "))["nc"]
+        assert nc1 == "00000001"
+
+        r2 = await client.get(url, auth=auth)
+        assert r2.status_code == 200
+        assert len(r2.history) == 0
+
+        nc2 = parse_keqv_list(r2.request.headers["Authorization"].split(", "))["nc"]
+        assert nc2 == "00000002"
+
+        r3 = await client.get(url, auth=auth)
+        assert r3.status_code == 200
+        assert len(r3.history) == 0
+
+        nc3 = parse_keqv_list(r3.request.headers["Authorization"].split(", "))["nc"]
+        assert nc3 == "00000003"
+
+
+def test_sync_digest_auth_reuse_state_consistency() -> None:
+    url = "https://example.org/"
+    auth = httpx.DigestAuth(username="user", password="password123")
+    app = DigestApp(regenerate_nonce=False)
+
+    with httpx.Client(transport=httpx.MockTransport(app)) as client:
+        r1 = client.get(url, auth=auth)
+        assert r1.status_code == 200
+        assert len(r1.history) == 1
+
+        nc1 = parse_keqv_list(r1.request.headers["Authorization"].split(", "))["nc"]
+        assert nc1 == "00000001"
+
+        r2 = client.get(url, auth=auth)
+        assert r2.status_code == 200
+        assert len(r2.history) == 0
+
+        nc2 = parse_keqv_list(r2.request.headers["Authorization"].split(", "))["nc"]
+        assert nc2 == "00000002"
+
+        r3 = client.get(url, auth=auth)
+        assert r3.status_code == 200
+        assert len(r3.history) == 0
+
+        nc3 = parse_keqv_list(r3.request.headers["Authorization"].split(", "))["nc"]
+        assert nc3 == "00000003"

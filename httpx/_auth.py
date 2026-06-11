@@ -72,17 +72,20 @@ class Auth:
             request.read()
 
         flow = self.auth_flow(request)
-        request = next(flow)
+        try:
+            request = next(flow)
 
-        while True:
-            response = yield request
-            if self.requires_response_body:
-                response.read()
+            while True:
+                response = yield request
+                if self.requires_response_body:
+                    response.read()
 
-            try:
-                request = flow.send(response)
-            except StopIteration:
-                break
+                try:
+                    request = flow.send(response)
+                except StopIteration:
+                    break
+        finally:
+            flow.close()
 
     async def async_auth_flow(
         self, request: Request
@@ -97,17 +100,20 @@ class Auth:
             await request.aread()
 
         flow = self.auth_flow(request)
-        request = next(flow)
+        try:
+            request = next(flow)
 
-        while True:
-            response = yield request
-            if self.requires_response_body:
-                await response.aread()
+            while True:
+                response = yield request
+                if self.requires_response_body:
+                    await response.aread()
 
-            try:
-                request = flow.send(response)
-            except StopIteration:
-                break
+                try:
+                    request = flow.send(response)
+                except StopIteration:
+                    break
+        finally:
+            flow.close()
 
 
 class FunctionAuth(Auth):
@@ -184,6 +190,8 @@ class DigestAuth(Auth):
         "SHA-512-SESS": hashlib.sha512,
     }
 
+    requires_request_body = True
+
     def __init__(self, username: str | bytes, password: str | bytes) -> None:
         self._username = to_bytes(username)
         self._password = to_bytes(password)
@@ -193,8 +201,9 @@ class DigestAuth(Auth):
     def auth_flow(self, request: Request) -> typing.Generator[Request, Response, None]:
         if self._last_challenge:
             request.headers["Authorization"] = self._build_auth_header(
-                request, self._last_challenge
+                request, self._last_challenge, self._nonce_count
             )
+            self._nonce_count += 1
 
         response = yield request
 
@@ -215,8 +224,9 @@ class DigestAuth(Auth):
         self._nonce_count = 1
 
         request.headers["Authorization"] = self._build_auth_header(
-            request, self._last_challenge
+            request, self._last_challenge, self._nonce_count
         )
+        self._nonce_count += 1
         if response.cookies:
             Cookies(response.cookies).set_cookie_header(request=request)
         yield request
@@ -253,7 +263,10 @@ class DigestAuth(Auth):
             raise ProtocolError(message, request=request) from exc
 
     def _build_auth_header(
-        self, request: Request, challenge: _DigestAuthChallenge
+        self,
+        request: Request,
+        challenge: _DigestAuthChallenge,
+        nonce_count: int,
     ) -> str:
         hash_func = self._ALGORITHM_TO_HASH_FUNCTION[challenge.algorithm.upper()]
 
@@ -267,9 +280,8 @@ class DigestAuth(Auth):
         # TODO: implement auth-int
         HA2 = digest(A2)
 
-        nc_value = b"%08x" % self._nonce_count
-        cnonce = self._get_client_nonce(self._nonce_count, challenge.nonce)
-        self._nonce_count += 1
+        nc_value = b"%08x" % nonce_count
+        cnonce = self._get_client_nonce(nonce_count, challenge.nonce)
 
         HA1 = digest(A1)
         if challenge.algorithm.lower().endswith("-sess"):
