@@ -460,3 +460,77 @@ def test_client_decode_text_using_explicit_encoding():
         assert response.reason_phrase == "OK"
         assert response.encoding == "ISO-8859-1"
         assert response.text == text
+
+
+def test_elapsed_set_after_read():
+    def handler(request: httpx.Request) -> httpx.Response:
+        class HelloStream(httpx.SyncByteStream):
+            def __iter__(self) -> typing.Iterator[bytes]:
+                yield b"Hello, world!"
+
+        return httpx.Response(200, stream=HelloStream())
+
+    transport = httpx.MockTransport(handler)
+    with httpx.Client(transport=transport) as client:
+        response = client.get("https://www.example.com")
+    assert isinstance(response.elapsed, timedelta)
+    assert response.elapsed > timedelta(0)
+
+
+def test_elapsed_set_on_iteration_error():
+    def handler(request: httpx.Request) -> httpx.Response:
+        class FailingStream(httpx.SyncByteStream):
+            def __iter__(self) -> typing.Iterator[bytes]:
+                yield b"Hello"
+                raise ValueError("stream broke")
+
+        return httpx.Response(200, stream=FailingStream())
+
+    transport = httpx.MockTransport(handler)
+    with httpx.Client(transport=transport) as client:
+        with pytest.raises(ValueError, match="stream broke"):
+            client.get("https://www.example.com")
+
+
+def test_elapsed_set_on_close_error():
+    def handler(request: httpx.Request) -> httpx.Response:
+        class FailOnCloseStream(httpx.SyncByteStream):
+            def __iter__(self) -> typing.Iterator[bytes]:
+                yield b"Hello"
+
+            def close(self) -> None:
+                raise ValueError("close failed")
+
+        return httpx.Response(200, stream=FailOnCloseStream())
+
+    transport = httpx.MockTransport(handler)
+    with httpx.Client(transport=transport) as client:
+        response = client.send(
+            client.build_request("GET", "https://www.example.com"),
+            stream=True,
+        )
+        with pytest.raises(ValueError, match="close failed"):
+            list(response.stream)
+            response.close()
+        assert isinstance(response.elapsed, timedelta)
+        assert response.elapsed > timedelta(0)
+
+
+def test_elapsed_not_overwritten_after_iter():
+    def handler(request: httpx.Request) -> httpx.Response:
+        class HelloStream(httpx.SyncByteStream):
+            def __iter__(self) -> typing.Iterator[bytes]:
+                yield b"Hello, world!"
+
+        return httpx.Response(200, stream=HelloStream())
+
+    transport = httpx.MockTransport(handler)
+    with httpx.Client(transport=transport) as client:
+        response = client.send(
+            client.build_request("GET", "https://www.example.com"),
+            stream=True,
+        )
+        list(response.stream)
+        elapsed_after_iter = response.elapsed
+        response.close()
+        assert response.elapsed == elapsed_after_iter

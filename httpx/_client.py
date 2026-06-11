@@ -148,15 +148,26 @@ class BoundSyncStream(SyncByteStream):
         self._stream = stream
         self._response = response
         self._start = start
+        self._elapsed_set = False
+
+    def _set_elapsed(self) -> None:
+        if not self._elapsed_set:
+            self._elapsed_set = True
+            elapsed = time.perf_counter() - self._start
+            self._response.elapsed = datetime.timedelta(seconds=elapsed)
 
     def __iter__(self) -> typing.Iterator[bytes]:
-        for chunk in self._stream:
-            yield chunk
+        try:
+            for chunk in self._stream:
+                yield chunk
+        finally:
+            self._set_elapsed()
 
     def close(self) -> None:
-        elapsed = time.perf_counter() - self._start
-        self._response.elapsed = datetime.timedelta(seconds=elapsed)
-        self._stream.close()
+        try:
+            self._stream.close()
+        finally:
+            self._set_elapsed()
 
 
 class BoundAsyncStream(AsyncByteStream):
@@ -171,15 +182,26 @@ class BoundAsyncStream(AsyncByteStream):
         self._stream = stream
         self._response = response
         self._start = start
+        self._elapsed_set = False
+
+    def _set_elapsed(self) -> None:
+        if not self._elapsed_set:
+            self._elapsed_set = True
+            elapsed = time.perf_counter() - self._start
+            self._response.elapsed = datetime.timedelta(seconds=elapsed)
 
     async def __aiter__(self) -> typing.AsyncIterator[bytes]:
-        async for chunk in self._stream:
-            yield chunk
+        try:
+            async for chunk in self._stream:
+                yield chunk
+        finally:
+            self._set_elapsed()
 
     async def aclose(self) -> None:
-        elapsed = time.perf_counter() - self._start
-        self._response.elapsed = datetime.timedelta(seconds=elapsed)
-        await self._stream.aclose()
+        try:
+            await self._stream.aclose()
+        finally:
+            self._set_elapsed()
 
 
 EventHook = typing.Callable[..., typing.Any]

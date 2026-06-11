@@ -373,3 +373,85 @@ async def test_server_extensions(server):
         response = await client.get(url)
     assert response.status_code == 200
     assert response.extensions["http_version"] == b"HTTP/1.1"
+
+
+@pytest.mark.anyio
+async def test_elapsed_set_after_aread():
+    async def handler(request: httpx.Request) -> httpx.Response:
+        class HelloStream(httpx.AsyncByteStream):
+            async def __aiter__(self) -> typing.AsyncIterator[bytes]:
+                yield b"Hello, world!"
+
+        return httpx.Response(200, stream=HelloStream())
+
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport) as client:
+        response = await client.get("https://www.example.com")
+    assert isinstance(response.elapsed, timedelta)
+    assert response.elapsed > timedelta(0)
+
+
+@pytest.mark.anyio
+async def test_elapsed_set_on_iteration_error():
+    async def handler(request: httpx.Request) -> httpx.Response:
+        class FailingStream(httpx.AsyncByteStream):
+            async def __aiter__(self) -> typing.AsyncIterator[bytes]:
+                yield b"Hello"
+                raise ValueError("stream broke")
+
+        return httpx.Response(200, stream=FailingStream())
+
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport) as client:
+        with pytest.raises(ValueError, match="stream broke"):
+            await client.get("https://www.example.com")
+
+
+@pytest.mark.anyio
+async def test_elapsed_set_on_close_error():
+    async def handler(request: httpx.Request) -> httpx.Response:
+        class FailOnCloseStream(httpx.AsyncByteStream):
+            async def __aiter__(self) -> typing.AsyncIterator[bytes]:
+                yield b"Hello"
+
+            async def aclose(self) -> None:
+                raise ValueError("close failed")
+
+        return httpx.Response(200, stream=FailOnCloseStream())
+
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport) as client:
+        response = await client.send(
+            client.build_request("GET", "https://www.example.com"),
+            stream=True,
+        )
+        with pytest.raises(ValueError, match="close failed"):
+            chunks = []
+            async for chunk in response.stream:
+                chunks.append(chunk)
+            await response.aclose()
+        assert isinstance(response.elapsed, timedelta)
+        assert response.elapsed > timedelta(0)
+
+
+@pytest.mark.anyio
+async def test_elapsed_not_overwritten_after_aiter():
+    async def handler(request: httpx.Request) -> httpx.Response:
+        class HelloStream(httpx.AsyncByteStream):
+            async def __aiter__(self) -> typing.AsyncIterator[bytes]:
+                yield b"Hello, world!"
+
+        return httpx.Response(200, stream=HelloStream())
+
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport) as client:
+        response = await client.send(
+            client.build_request("GET", "https://www.example.com"),
+            stream=True,
+        )
+        chunks = []
+        async for chunk in response.stream:
+            chunks.append(chunk)
+        elapsed_after_iter = response.elapsed
+        await response.aclose()
+        assert response.elapsed == elapsed_after_iter
