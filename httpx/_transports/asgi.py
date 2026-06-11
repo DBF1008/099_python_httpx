@@ -134,7 +134,7 @@ class ASGITransport(AsyncBaseTransport):
         async def receive() -> dict[str, typing.Any]:
             nonlocal request_complete
 
-            if request_complete:
+            if request_complete or response_complete.is_set():
                 await response_complete.wait()
                 return {"type": "http.disconnect"}
 
@@ -172,13 +172,20 @@ class ASGITransport(AsyncBaseTransport):
             if self.raise_app_exceptions:
                 raise
 
-            response_complete.set()
+            if not response_complete.is_set():
+                response_complete.set()
             if status_code is None:
                 status_code = 500
             if response_headers is None:
                 response_headers = {}
+        finally:
+            if not request_complete:
+                aclose = getattr(request_body_chunks, "aclose", None)
+                if aclose is not None:
+                    await aclose()
 
-        assert response_complete.is_set()
+        if not response_complete.is_set():
+            response_complete.set()
         assert status_code is not None
         assert response_headers is not None
 

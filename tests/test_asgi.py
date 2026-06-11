@@ -222,3 +222,95 @@ async def test_asgi_exc_no_raise():
         response = await client.get("http://www.example.org/")
 
         assert response.status_code == 500
+
+
+@pytest.mark.anyio
+async def test_asgi_partial_request_body_disconnect():
+    disconnect_received = False
+
+    async def partial_read(scope, receive, send):
+        nonlocal disconnect_received
+
+        message = await receive()
+        assert message["type"] == "http.request"
+
+        await send(
+            {
+                "type": "http.response.start",
+                "status": 200,
+                "headers": [(b"content-type", b"text/plain")],
+            }
+        )
+        await send({"type": "http.response.body", "body": b"OK", "more_body": False})
+
+        message = await receive()
+        disconnect_received = message["type"] == "http.disconnect"
+
+    transport = httpx.ASGITransport(app=partial_read)
+    async with httpx.AsyncClient(transport=transport) as client:
+        response = await client.post(
+            "http://www.example.org/", content=b"chunk1chunk2chunk3"
+        )
+
+    assert response.status_code == 200
+    assert response.text == "OK"
+    assert disconnect_received
+
+
+@pytest.mark.anyio
+async def test_asgi_sequential_requests():
+    async def partial_read_echo(scope, receive, send):
+        message = await receive()
+        body = message.get("body", b"")
+
+        await send(
+            {
+                "type": "http.response.start",
+                "status": 200,
+                "headers": [(b"content-type", b"text/plain")],
+            }
+        )
+        await send({"type": "http.response.body", "body": body, "more_body": False})
+
+    transport = httpx.ASGITransport(app=partial_read_echo)
+    async with httpx.AsyncClient(transport=transport) as client:
+        response1 = await client.post(
+            "http://www.example.org/", content=b"first-request-body"
+        )
+        response2 = await client.post(
+            "http://www.example.org/", content=b"second-request-body"
+        )
+
+    assert response1.status_code == 200
+    assert response2.status_code == 200
+    assert response2.text == "second-request-body"
+
+
+@pytest.mark.anyio
+async def test_asgi_head_request():
+    transport = httpx.ASGITransport(app=hello_world)
+    async with httpx.AsyncClient(transport=transport) as client:
+        response = await client.head("http://www.example.org/")
+
+    assert response.status_code == 200
+    assert response.content == b""
+
+
+@pytest.mark.anyio
+async def test_asgi_exc_after_response_start():
+    async def exc_after_start(scope, receive, send):
+        await send(
+            {
+                "type": "http.response.start",
+                "status": 200,
+                "headers": [(b"content-type", b"text/plain")],
+            }
+        )
+        raise RuntimeError("app crashed after response start")
+
+    transport = httpx.ASGITransport(app=exc_after_start, raise_app_exceptions=False)
+    async with httpx.AsyncClient(transport=transport) as client:
+        response = await client.get("http://www.example.org/")
+
+    assert response.status_code == 200
+    assert response.content == b""
