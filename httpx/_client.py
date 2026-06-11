@@ -581,6 +581,35 @@ class BaseClient:
 
         return request.stream
 
+    def _follow_redirect(
+        self,
+        request: Request,
+        response: Response,
+        follow_redirects: bool,
+        history: list[Response],
+    ) -> Request | None:
+        """
+        Called after each response during the redirect loop.
+
+        If the response is a redirect, builds the next request, appends the
+        current response to the history, and returns the next request to send
+        (when ``follow_redirects`` is True) or ``None`` (when it is False,
+        after setting ``response.next_request``).
+
+        Returns ``None`` immediately when the response is not a redirect.
+        """
+        if not response.has_redirect_location:
+            return None
+
+        next_request = self._build_redirect_request(request, response)
+        history += [response]
+
+        if follow_redirects:
+            return next_request
+
+        response.next_request = next_request
+        return None
+
     def _set_timeout(self, request: Request) -> None:
         if "timeout" not in request.extensions:
             timeout = (
@@ -982,17 +1011,15 @@ class Client(BaseClient):
                     hook(response)
                 response.history = list(history)
 
-                if not response.has_redirect_location:
+                next_request = self._follow_redirect(
+                    request, response, follow_redirects, history
+                )
+                if next_request is None:
                     return response
 
-                request = self._build_redirect_request(request, response)
-                history = history + [response]
-
+                request = next_request
                 if follow_redirects:
                     response.read()
-                else:
-                    response.next_request = request
-                    return response
 
             except BaseException as exc:
                 response.close()
@@ -1695,20 +1722,17 @@ class AsyncClient(BaseClient):
             try:
                 for hook in self._event_hooks["response"]:
                     await hook(response)
-
                 response.history = list(history)
 
-                if not response.has_redirect_location:
+                next_request = self._follow_redirect(
+                    request, response, follow_redirects, history
+                )
+                if next_request is None:
                     return response
 
-                request = self._build_redirect_request(request, response)
-                history = history + [response]
-
+                request = next_request
                 if follow_redirects:
                     await response.aread()
-                else:
-                    response.next_request = request
-                    return response
 
             except BaseException as exc:
                 await response.aclose()
